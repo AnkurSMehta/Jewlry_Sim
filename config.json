@@ -14,6 +14,14 @@
     "metal": { "unit_cost": 50.0, "opening_stock": 500, "safety_stock": 100 },
     "stone": { "unit_cost": 100.0, "opening_stock": 500, "safety_stock": 100 }
   },
+  "design_stage": {
+    "cost_per_order": 100.0,
+    "management_cost_per_order": 0.1,
+    "time_days": 1,
+    "metal_savings_probability": 0.25,
+    "reduced_metal_per_unit": 0.9,
+    "standard_metal_per_unit": 1.0
+  },
   "artisan_resources": {
     "pre_production": {
       "REG_PAY": { "start_count": 60, "max_count": 80, "units_per_day": 5, "daily_cost": 10.0, "management_cost": 0.4, "max_overtime_days": 0.5 },
