@@ -35,18 +35,5 @@
       "SKILL_CON": { "start_count": 15, "max_count": 30, "units_per_day": 8, "daily_cost": 30.0, "management_cost": 1.0, "max_overtime_days": 0.0 },
       "OUT_CON": { "start_count": 15, "max_count": 40, "units_per_day": 8, "daily_cost": 40.0, "management_cost": 0.3, "max_overtime_days": 0.0 }
     }
-  },
-  "opening_orders": {
-    "type_O": [
-      { "units": 5, "count": 10 },
-      { "units": 10, "count": 10 },
-      { "units": 25, "count": 4 },
-      { "units": 50, "count": 2 }
-    ],
-    "type_J": [
-      { "units": 5, "count": 10 },
-      { "units": 10, "count": 5 },
-      { "units": 25, "count": 2 }
-    ]
   }
 }
