@@ -1,12 +1,31 @@
 {
   "simulation_settings": {
     "duration_days": 7,
+    "target_min_avg_delivery_score": 90.0,
     "management_capacity_daily": 250.0,
-    "equipment_capacity_daily": 1500,
-    "min_raw_material_safety_stock": 100
+    "min_raw_material_safety_stock": 100,
+    "equipment_capacity_daily": {
+      "design_orders": 50,
+      "pre_production_units": 1500,
+      "post_production_units": 1500
+    }
   },
   "raw_materials": {
     "metal": { "unit_cost": 50.0, "opening_stock": 500, "safety_stock": 100 },
     "stone": { "unit_cost": 100.0, "opening_stock": 500, "safety_stock": 100 }
+  },
+  "artisan_resources": {
+    "pre_production": {
+      "REG_PAY": { "start_count": 60, "max_count": 80, "units_per_day": 5, "daily_cost": 10.0, "management_cost": 0.4, "max_overtime_days": 0.5 },
+      "SKILL_PAY": { "start_count": 20, "max_count": 20, "units_per_day": 5, "daily_cost": 15.0, "management_cost": 2.0, "max_overtime_days": 0.5 },
+      "SKILL_CON": { "start_count": 10, "max_count": 15, "units_per_day": 8, "daily_cost": 30.0, "management_cost": 1.0, "max_overtime_days": 0.0 },
+      "OUT_CON": { "start_count": 10, "max_count": 30, "units_per_day": 8, "daily_cost": 40.0, "management_cost": 0.3, "max_overtime_days": 0.0 }
+    },
+    "post_production": {
+      "REG_PAY": { "start_count": 70, "max_count": 80, "units_per_day": 5, "daily_cost": 10.0, "management_cost": 0.4, "max_overtime_days": 0.5 },
+      "SKILL_PAY": { "start_count": 20, "max_count": 25, "units_per_day": 5, "daily_cost": 15.0, "management_cost": 2.0, "max_overtime_days": 0.5 },
+      "SKILL_CON": { "start_count": 15, "max_count": 30, "units_per_day": 8, "daily_cost": 30.0, "management_cost": 1.0, "max_overtime_days": 0.0 },
+      "OUT_CON": { "start_count": 15, "max_count": 40, "units_per_day": 8, "daily_cost": 40.0, "management_cost": 0.3, "max_overtime_days": 0.0 }
+    }
   }
 }
