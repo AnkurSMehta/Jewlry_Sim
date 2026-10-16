@@ -33,28 +33,12 @@ st.markdown("""
         font-size: 0.98rem !important;
         line-height: 1.5 !important;
     }
-    .lp-callout-nofill {
-        background-color: #ffffff !important;
-        border: 2px solid #0284c7 !important;
-        border-radius: 0.6rem !important;
-        padding: 1.2rem !important;
-        margin-top: 1.5rem !important;
-        margin-bottom: 1.5rem !important;
-    }
-    .lp-callout-nofill h3, .lp-callout-nofill h4 {
-        color: #0f172a !important;
-        font-weight: 800 !important;
-        margin-top: 0.2rem !important;
-    }
-    .lp-callout-nofill p, .lp-callout-nofill span, .lp-callout-nofill div {
-        color: #0f172a !important;
-        font-size: 1.05rem !important;
-        font-weight: 600 !important;
-    }
     .metric-label { font-size: 0.8rem; color: #94a3b8; font-weight: 600; }
     .metric-val { font-size: 1.5rem; font-weight: 700; color: #f8fafc; }
     .score-good { color: #10b981; font-weight: bold; }
     .score-warn { color: #f59e0b; font-weight: bold; }
+    .binding-badge { background-color: #ef4444; color: white; padding: 2px 8px; border-radius: 4px; font-weight: bold; font-size: 0.85rem; }
+    .slack-badge { background-color: #10b981; color: white; padding: 2px 8px; border-radius: 4px; font-weight: bold; font-size: 0.85rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -82,17 +66,16 @@ cfg = load_default_config()
 
 def solve_daily_lp_benchmark(day_idx, demand_units, mgt_limit=250.0, equip_limit=1500, starting_metal=500.0, starting_stone=500.0):
     """
-    Computes the daily LP mathematical benchmark for given demand & starting stocks.
-    Returns optimal decisions: buy_m, buy_s, ot_reg, hire_out, total_cost.
+    Computes the mathematical LP benchmark using PuLP.
+    Passes mgt_limit and equip_limit directly as strict linear constraints.
+    Returns optimal decision variables, cost, status, and constraint binding/slack details.
     """
     try:
         prob = pulp.LpProblem(f"LP_Bench_Day_{day_idx}", pulp.LpMinimize)
         
-        # Usable stock accounting for 100u safety stock floor
         usable_metal = max(0.0, starting_metal - 100.0)
         usable_stone = max(0.0, starting_stone - 100.0)
         
-        # Required procurement to achieve demand
         req_proc_m = max(0.0, demand_units - usable_metal)
         req_proc_s = max(0.0, demand_units - usable_stone)
         
@@ -102,169 +85,194 @@ def solve_daily_lp_benchmark(day_idx, demand_units, mgt_limit=250.0, equip_limit
         ot_reg = pulp.LpVariable("ot_reg", lowBound=0.0, upBound=60.0, cat=pulp.LpContinuous)
         hire_out = pulp.LpVariable("hire_out", lowBound=0.0, upBound=30.0, cat=pulp.LpContinuous)
         
-        # Output capacity constraint (regular 860u base + 0.5 OT per artisan = +2.5u per OT day)
+        # Production output capacity constraint (860u base + 2.5u per OT day + 8.0u per outsource artisan)
         output_cap = 860.0 + (ot_reg * 2.5) + (hire_out * 8.0)
-        prob += (output_cap >= demand_units, "Demand_Fulfillment")
         
-        # Management bandwidth constraint
-        prob += (164.5 + (ot_reg * 0.4) + (hire_out * 0.3) <= mgt_limit, "Management_Capacity")
+        # Max processable units considering equipment cap and demand
+        target_prod = min(demand_units, float(equip_limit))
+        prob += (output_cap >= target_prod, "Output_Cap_Constraint")
+        prob += (output_cap <= float(equip_limit), "Equip_Cap_Constraint")
         
-        # Objective: Base Artisan ($3650) + OT Reg ($20/day) + Outsource ($40/day) + Raw Materials ($50/m + $100/s)
+        # Management capacity constraint
+        mgmt_expr = 164.5 + (ot_reg * 0.4) + (hire_out * 0.3)
+        prob += (mgmt_expr <= float(mgt_limit), "Management_Cap_Constraint")
+        
+        # Objective Function: Minimize Total Daily Cost
         daily_cost = 3650.0 + (ot_reg * 20.0) + (hire_out * 40.0) + (buy_m * 50.0) + (buy_s * 100.0)
         prob += daily_cost
         
         prob.solve(pulp.PULP_CBC_CMD(msg=0))
         
         if pulp.LpStatus[prob.status] == 'Optimal':
+            bm_val = float(pulp.value(buy_m))
+            bs_val = float(pulp.value(buy_s))
+            ot_val = float(pulp.value(ot_reg))
+            ho_val = float(pulp.value(hire_out))
+            tot_cost_val = float(pulp.value(daily_cost))
+            mgmt_used_val = 164.5 + (ot_val * 0.4) + (ho_val * 0.3)
+            out_cap_val = 860.0 + (ot_val * 2.5) + (ho_val * 8.0)
+            
+            # Constraint Slacks
+            mgmt_slack = float(mgt_limit) - mgmt_used_val
+            ot_slack = 60.0 - ot_val
+            out_slack = 30.0 - ho_val
+            equip_slack = float(equip_limit) - out_cap_val
+            
+            # Determine active bottleneck
+            if mgmt_slack < 0.1 and target_prod < demand_units:
+                bottleneck_str = "🔴 Management Bandwidth Cap Reached (Binding)"
+            elif ot_slack < 0.1 and out_slack > 0.1:
+                bottleneck_str = "🟡 Overtime Limit Maxed (60 Days Max)"
+            elif out_slack < 0.1 and ot_slack > 0.1:
+                bottleneck_str = "🔵 Outsource Contractor Limit Maxed (30 Artisans Max)"
+            elif equip_slack < 0.1:
+                bottleneck_str = "⚠️ Equipment Capacity Ceiling Reached (1,500 u/day)"
+            elif ot_val > 0.1 or ho_val > 0.1:
+                bottleneck_str = "🔵 Demand Exceeds Baseline (Overtime/Outsource Active)"
+            else:
+                bottleneck_str = "🟢 Baseline Capacity (Unconstrained)"
+                
             return {
-                'buy_m': float(pulp.value(buy_m)),
-                'buy_s': float(pulp.value(buy_s)),
-                'ot_reg': float(pulp.value(ot_reg)),
-                'hire_out': float(pulp.value(hire_out)),
-                'total_cost': float(pulp.value(daily_cost)),
-                'status': 'Optimal'
+                'buy_m': bm_val, 'buy_s': bs_val, 'ot_reg': ot_val, 'hire_out': ho_val,
+                'total_cost': tot_cost_val, 'mgmt_used': mgmt_used_val, 'output_cap': out_cap_val,
+                'mgmt_slack': mgmt_slack, 'ot_slack': ot_slack, 'out_slack': out_slack, 'equip_slack': equip_slack,
+                'status': 'Optimal', 'bottleneck': bottleneck_str
             }
     except Exception:
         pass
         
-    # Analytical Fallback
+    # Analytical Fallback Solver
     usable_metal = max(0.0, starting_metal - 100.0)
     usable_stone = max(0.0, starting_stone - 100.0)
     buy_m_val = max(0.0, demand_units - usable_metal)
     buy_s_val = max(0.0, demand_units - usable_stone)
     
-    needed_extra_units = max(0.0, demand_units - 860.0)
-    if needed_extra_units <= 0:
-        ot_val = 0.0
-        out_val = 0.0
+    needed_extra = max(0.0, demand_units - 860.0)
+    mgmt_headroom = max(0.0, float(mgt_limit) - 164.5)
+    
+    # Outsource contractor gives 8u for 0.3 mgmt ($40/day = $5.00/u) -> 26.67 u/mgmt
+    # Overtime gives 2.5u for 0.4 mgmt ($20/day = $8.00/u) -> 6.25 u/mgmt
+    # LP prefers Outsource Contractors first!
+    ho_val = min(30.0, needed_extra / 8.0, mgmt_headroom / 0.3)
+    rem_extra = max(0.0, needed_extra - (ho_val * 8.0))
+    rem_mgmt = max(0.0, mgmt_headroom - (ho_val * 0.3))
+    
+    ot_val = min(60.0, rem_extra / 2.5, rem_mgmt / 0.4)
+    
+    mgmt_used_val = 164.5 + (ot_val * 0.4) + (ho_val * 0.3)
+    out_cap_val = 860.0 + (ot_val * 2.5) + (ho_val * 8.0)
+    tot_cost_val = 3650.0 + (ot_val * 20.0) + (ho_val * 40.0) + (buy_m_val * 50.0) + (buy_s_val * 100.0)
+    
+    mgmt_slack = float(mgt_limit) - mgmt_used_val
+    ot_slack = 60.0 - ot_val
+    out_slack = 30.0 - ho_val
+    equip_slack = float(equip_limit) - out_cap_val
+    
+    if out_slack < 0.1 and ot_slack > 0.1:
+        bottleneck_str = "🔵 Outsource Contractors Maxed (30 Artisans, 0 Slack)"
+    elif mgmt_slack < 0.1:
+        bottleneck_str = "🔴 Management Bandwidth Cap Reached (Binding)"
+    elif ot_val > 0.1 or ho_val > 0.1:
+        bottleneck_str = "🔵 Demand Exceeds Baseline (Overtime/Outsource Active)"
     else:
-        ot_val = min(60.0, needed_extra_units / 2.5)
-        rem_units = max(0.0, needed_extra_units - (ot_val * 2.5))
-        out_val = rem_units / 8.0
+        bottleneck_str = "🟢 Baseline Capacity (Unconstrained)"
         
-    tot_c = 3650.0 + (ot_val * 20.0) + (out_val * 40.0) + (buy_m_val * 50.0) + (buy_s_val * 100.0)
     return {
-        'buy_m': buy_m_val,
-        'buy_s': buy_s_val,
-        'ot_reg': ot_val,
-        'hire_out': out_val,
-        'total_cost': tot_c,
-        'status': 'Analytical Benchmark'
+        'buy_m': buy_m_val, 'buy_s': buy_s_val, 'ot_reg': ot_val, 'hire_out': ho_val,
+        'total_cost': tot_cost_val, 'mgmt_used': mgmt_used_val, 'output_cap': out_cap_val,
+        'mgmt_slack': mgmt_slack, 'ot_slack': ot_slack, 'out_slack': out_slack, 'equip_slack': equip_slack,
+        'status': 'Optimal Benchmark', 'bottleneck': bottleneck_str
     }
 
 # --- OPTION 1: CASE STUDY TUTORIAL ---
 if mode == "📖 Option 1: Case Study Introduction & Tutorial":
-    st.header("📖 Case Study Introduction & Comprehensive Tutorial")
-    st.info("💡 **Welcome Student!** This tutorial covers the mathematical foundations of Linear Programming (LP), Discrete Event Simulation (DES), factory process flows, resource constraints, and 2 detailed worked case examples.")
-    
-    tab_theory, tab_cases = st.tabs(["📘 Part 1: Theory, Setup & Constraints", "📊 Part 2: Worked Case Tutorials (Low Load vs. High Load Surge)"])
-    
-    with tab_theory:
+    st.header("📖 Option 1: Case Study Introduction & Educational Tutorial")
+    st.info("💡 **Welcome Student!** Read through this two-part case study tutorial to master Linear Programming (LP) optimization, constraint binding vs. slack, and factory simulation dynamics before playing the game.")
+
+    tab1, tab2 = st.tabs(["📘 Part 1: Theory, Setup & Constraints", "📊 Part 2: Worked Tutorials & Constraint Progression"])
+
+    with tab1:
         st.markdown("""
-        ### 1. What is Linear Programming (LP) and Optimization?
-        **Linear Programming (LP)** is a mathematical optimization technique used to achieve the best outcome (such as lowest operational cost or highest throughput) in a mathematical model whose requirements are represented by linear relationships.
-        * **Objective Function:** The mathematical equation to minimize (e.g., `Total Daily Spend = Labor Costs + Material Procurement Costs`).
-        * **Decision Variables:** The controllable choices available to the factory manager (Metal Purchases, Stone Purchases, Overtime Hours, Contractor Hiring).
-        * **Constraints:** Real-world physical boundaries that cannot be breached (Labor Output Capacities, Equipment Capacities, Management Bandwidth, Raw Material Safety Stock Floors).
-
-        ### 2. How Simulation & Optimization Work Together
-        In real-world supply chain management, **Optimization (LP)** acts as the *Intelligent Planner*, determining the mathematically ideal decision variable values for a given single day. **Simulation (Discrete Event Simulation - DES)** acts as the *Physical Factory Engine*, moving inventory, tracking work-in-progress (WIP) queues across time, enforcing lead times, and updating order fulfillment states day-by-day.
-
-        ### 3. Factory Process Flow & Lead Times
-        The jewelry manufacturing facility operates across three sequential stages:
-        1. **Design Stage (Optional):** Custom orders may optionally undergo a 1-day design phase ($100 fee), offering a 25% chance of reducing metal requirements to 0.9 units/piece (otherwise 1.0 unit).
-        2. **Pre-Production Stage:** Material preparation, cutting, and shaping. Takes **1 day per unit** (Equipment capacity cap = 1,500 units/day).
-        3. **Post-Production Stage:** Assembly, gem setting, and polishing (Equipment capacity cap = 1,500 units/day).
-           * **Type O (Ordinary Orders):** Requires **1 day in Pre-Production + 1 day in Post-Production** (2-day manufacturing cycle).
-           * **Type J (Joining Orders):** Requires **1 day in Pre-Production + 2 days in Post-Production** (3-day manufacturing cycle).
-
-        ### 4. Resource Constraints & Operating Rules Matrix
-        """)
-        
-        resource_df = pd.DataFrame([
-            {"Artisan Class": "Regular Payroll", "Starting Staff (Pre / Post)": "60 / 70", "Daily Output Rate": "5 u/day", "Base Daily Cost": "$10/day ($2.00/u)", "Overtime Cap": "0.5 days ($20/day)", "Allowed Orders": "Type O Only", "Mgmt Cost": "0.4 u / artisan"},
-            {"Artisan Class": "Skilled Payroll", "Starting Staff (Pre / Post)": "20 / 20", "Daily Output Rate": "5 u/day", "Base Daily Cost": "$15/day ($3.00/u)", "Overtime Cap": "0.5 days ($30/day)", "Allowed Orders": "Type O & Type J", "Mgmt Cost": "2.0 u / artisan"},
-            {"Artisan Class": "Skilled Contractor", "Starting Staff (Pre / Post)": "10 / 15", "Daily Output Rate": "8 u/day", "Base Daily Cost": "$30/day ($3.75/u)", "Overtime Cap": "None", "Allowed Orders": "Type O & Type J", "Mgmt Cost": "1.0 u / artisan"},
-            {"Artisan Class": "Outsource Contractor", "Starting Staff (Pre / Post)": "10 / 15", "Daily Output Rate": "8 u/day", "Base Daily Cost": "$40/day ($5.00/u)", "Overtime Cap": "None", "Allowed Orders": "Type O & Type J", "Mgmt Cost": "0.3 u / artisan"}
-        ])
-        st.table(resource_df)
-
-        st.markdown("""
-        ### 5. Raw Material Safety Floor & Procurement Math
-        * **Bill of Materials (BOM):** Every finished product unit consumes **1 unit Metal ($50)** and **1 unit Stone ($100)**.
-        * **Mandatory Safety Floor:** The factory must maintain a minimum of **100 units Metal** and **100 units Stone** in raw inventory at all times.
-        * **Usable Stock Formula:** `Usable Stock = max(0, Current Raw Stock - 100)`
-        
-        > **⚠️ Procurement Math Example:**  
-        > If today's incoming demand is **500 units** and starting metal raw stock is **200 units**, usable stock is only **100 units** (`200 - 100 = 100`).  
-        > To fulfill the 500 units of demand, the manager **must procure at least 400 additional units** (`500 - 100 = 400`).  
-        > If less than 400 units are procured, fewer units enter production, resulting in an unfulfilled **Pre-Production Backlog Queue**!
-        """)
-
-    with tab_cases:
-        st.markdown("""
-        ### Case Example 1: Low Order Demand Load (~500 units/day)
-        When incoming daily demand is 500 units/day, the baseline regular-time staff capacity (860 units/day in Pre-Production) easily absorbs the workload during standard hours.
-
-        #### Day-by-Day LP Decision Breakdown (Low Demand Load):
-        """)
-        
-        low_df = pd.DataFrame([
-            {"Day": "Day 1", "Workload Demand": "500 u", "Metal Procured": "100 u", "Stone Procured": "100 u", "Reg Overtime": "0.0 days", "Outsource Hired": "0.0 artisans", "Mgmt Used": "164.5 / 250 u", "Daily Cost": "$18,650.00", "Constraint State": "Baseline Capacity (No Overtime Needed)"},
-            {"Day": "Day 2", "Workload Demand": "500 u", "Metal Procured": "500 u", "Stone Procured": "500 u", "Reg Overtime": "0.0 days", "Outsource Hired": "0.0 artisans", "Mgmt Used": "164.5 / 250 u", "Daily Cost": "$78,650.00", "Constraint State": "Baseline Capacity (No Overtime Needed)"},
-            {"Day": "Day 3", "Workload Demand": "500 u", "Metal Procured": "500 u", "Stone Procured": "500 u", "Reg Overtime": "0.0 days", "Outsource Hired": "0.0 artisans", "Mgmt Used": "164.5 / 250 u", "Daily Cost": "$78,650.00", "Constraint State": "Baseline Capacity (No Overtime Needed)"},
-            {"Day": "Day 4", "Workload Demand": "500 u", "Metal Procured": "500 u", "Stone Procured": "500 u", "Reg Overtime": "0.0 days", "Outsource Hired": "0.0 artisans", "Mgmt Used": "164.5 / 250 u", "Daily Cost": "$78,650.00", "Constraint State": "Baseline Capacity (No Overtime Needed)"},
-            {"Day": "Day 5", "Workload Demand": "500 u", "Metal Procured": "500 u", "Stone Procured": "500 u", "Reg Overtime": "0.0 days", "Outsource Hired": "0.0 artisans", "Mgmt Used": "164.5 / 250 u", "Daily Cost": "$78,650.00", "Constraint State": "Baseline Capacity (No Overtime Needed)"},
-            {"Day": "Day 6", "Workload Demand": "500 u", "Metal Procured": "500 u", "Stone Procured": "500 u", "Reg Overtime": "0.0 days", "Outsource Hired": "0.0 artisans", "Mgmt Used": "164.5 / 250 u", "Daily Cost": "$78,650.00", "Constraint State": "Baseline Capacity (No Overtime Needed)"},
-            {"Day": "Day 7", "Workload Demand": "500 u", "Metal Procured": "500 u", "Stone Procured": "500 u", "Reg Overtime": "0.0 days", "Outsource Hired": "0.0 artisans", "Mgmt Used": "164.5 / 250 u", "Daily Cost": "$78,650.00", "Constraint State": "Baseline Capacity (No Overtime Needed)"}
-        ])
-        st.table(low_df)
-
-        st.markdown("""
-        **🎓 LP Explanation for Low Load Case:**
-        * **Zero Overtime & Zero Contractor Hiring:** Baseline output (860 u/day) exceeds demand (500 u/day), so $0 is spent on overtime or contractor fees.
-        * **Unbinding Management Capacity:** Management bandwidth remains at **164.5 / 250.0 units** (~65.8% utilization).
-        * **Total 7-Day Spend:** **$574,550.00** with 100% On-Time Delivery fulfillment.
+        ### 1. Fundamentals of Optimization & Simulation
+        In modern operations management, two complementary analytical tools work together:
+        * **Linear Programming (LP) Solver (*The Intelligent Planner*):** A mathematical optimization algorithm that evaluates cost functions, capacity bounds, and resource limits to determine the mathematically optimal decision variables.
+        * **Discrete Event Simulation (DES) (*The Physical Factory Engine*):** A dynamic event-driven engine that processes orders, tracks raw material stocks, moves work-in-progress (WIP) through factory benches, and measures delivery performance.
 
         ---
 
-        ### Case Example 2: High Demand Surge Load (~1,000–1,500 units/day)
-        When demand surges above 860 units/day, baseline regular-time staff is insufficient. The LP solver triggers a progressive sequence of capacity expansion measures.
+        ### 2. Manufacturing Flow & Lead Times
+        1. **Design Stage (Optional):** Takes 1 day per order ($100 fee). Offers a 25% chance of reducing metal consumption to 0.9 units/piece (otherwise 1.0 unit).
+        2. **Pre-Production Stage:** Material cutting and prep (1 day lead time). Equipment limit = 1,500 units/day.
+        3. **Post-Production Stage:** Finishing and assembly. Equipment limit = 1,500 units/day.
+        * **Order Type Cycle Times:**
+          * **Type O (Ordinary Orders):** Requires 1 day in Pre-Production + 1 day in Post-Production = **2-Day Total Cycle Time**.
+          * **Type J (Joining Orders):** Requires 1 day in Pre-Production + 2 days in Post-Production = **3-Day Total Cycle Time**.
 
-        #### Day-by-Day LP Decision Breakdown (High Demand Surge Load):
+        ---
+
+        ### 3. Resource Matrix & Operational Rules Table
         """)
 
-        high_df = pd.DataFrame([
-            {"Day": "Day 1", "Workload Demand": "500 u", "Metal Procured": "100 u", "Stone Procured": "100 u", "Reg Overtime": "0.0 days", "Outsource Hired": "0.0 artisans", "Mgmt Used": "164.5 / 250 u", "Daily Cost": "$18,650.00", "Constraint State": "Baseline Capacity"},
-            {"Day": "Day 2", "Workload Demand": "755 u", "Metal Procured": "755 u", "Stone Procured": "755 u", "Reg Overtime": "30.0 days", "Outsource Hired": "0.0 artisans", "Mgmt Used": "176.5 / 250 u", "Daily Cost": "$117,500.00", "Constraint State": "🔵 Regular Payroll Overtime Active ($2.67/u output)"},
-            {"Day": "Day 3", "Workload Demand": "1,130 u", "Metal Procured": "1,130 u", "Stone Procured": "1,130 u", "Reg Overtime": "60.0 days", "Outsource Hired": "15.0 artisans", "Mgmt Used": "218.1 / 250 u", "Daily Cost": "$176,100.00", "Constraint State": "🟡 Regular OT Maxed (60 days) -> Outsource Hired"},
-            {"Day": "Day 4", "Workload Demand": "1,500 u", "Metal Procured": "1,500 u", "Stone Procured": "1,500 u", "Reg Overtime": "60.0 days", "Outsource Hired": "20.0 artisans", "Mgmt Used": "250.0 / 250 u", "Daily Cost": "$232,450.00", "Constraint State": "🔴 Management Bandwidth Limit (250u Cap) Maxed"},
-            {"Day": "Day 5", "Workload Demand": "1,500 u", "Metal Procured": "1,500 u", "Stone Procured": "1,500 u", "Reg Overtime": "60.0 days", "Outsource Hired": "20.0 artisans", "Mgmt Used": "250.0 / 250 u", "Daily Cost": "$232,450.00", "Constraint State": "⚠️ Equipment Capacity Ceiling (1,500u Cap) Maxed"},
-            {"Day": "Day 6", "Workload Demand": "1,000 u", "Metal Procured": "1,000 u", "Stone Procured": "1,000 u", "Reg Overtime": "56.0 days", "Outsource Hired": "0.0 artisans", "Mgmt Used": "186.9 / 250 u", "Daily Cost": "$154,770.00", "Constraint State": "🔵 Regular Payroll Overtime Active"},
-            {"Day": "Day 7", "Workload Demand": "500 u", "Metal Procured": "500 u", "Stone Procured": "500 u", "Reg Overtime": "0.0 days", "Outsource Hired": "0.0 artisans", "Mgmt Used": "164.5 / 250 u", "Daily Cost": "$78,650.00", "Constraint State": "Baseline Capacity"}
+        res_table = pd.DataFrame([
+            {"Artisan Class": "Regular Payroll", "Base Staff (Pre/Post)": "60 / 70", "Output Rate": "5 u/day", "Base Rate": "$10/day ($2.00/u)", "Overtime Rule": "Up to 0.5 day ($20/day)", "Allowed Orders": "Type O Only", "Mgmt Overhead": "0.4 units / artisan"},
+            {"Artisan Class": "Skilled Payroll", "Base Staff (Pre/Post)": "20 / 20", "Output Rate": "5 u/day", "Base Rate": "$15/day ($3.00/u)", "Overtime Rule": "Up to 0.5 day ($30/day)", "Allowed Orders": "Type O & Type J", "Mgmt Overhead": "2.0 units / artisan"},
+            {"Artisan Class": "Skilled Contractor", "Base Staff (Pre/Post)": "10 / 15", "Output Rate": "8 u/day", "Base Rate": "$30/day ($3.75/u)", "Overtime Rule": "None", "Allowed Orders": "Type O & Type J", "Mgmt Overhead": "1.0 unit / artisan"},
+            {"Artisan Class": "Outsource Contractor", "Base Staff (Pre/Post)": "10 / 15", "Output Rate": "8 u/day", "Base Rate": "$40/day ($5.00/u)", "Overtime Rule": "None", "Allowed Orders": "Type O & Type J", "Mgmt Overhead": "0.3 units / artisan"}
         ])
-        st.table(high_df)
+        st.table(res_table)
 
+        st.markdown(r"""
+        * **Bill of Materials (BOM):** Each product unit requires **1 unit Metal ($50)** + **1 unit Stone ($100)**.
+        * **Safety Stock Floor Rule:** Raw material inventory must **never drop below 100 units**.
+          \\[\\text{Usable Raw Stock} = \max(0.0,\; \text{Current Stock} - 100.0)\]
+          *Example:* If today's demand is **500 units** and starting metal stock is **200 units**, usable stock is **100 units** (200 - 100). The factory must procure at least **400 units** (`500 - 100 = 400`). If less than 400 units are procured, production stutters and unfulfilled orders enter the **Backlog Queue**.
+        * **Management Bandwidth Cap:** Default cap = **250.0 units/day** (or 180.0 in tight scenarios).
+          \\[\\text{Management Consumption} = 164.5 \text{ (Base Floor)} + (\text{OT Days} \times 0.4) + (\text{Outsource Artisans} \times 0.3) \le \text{Mgmt Cap}\]
+        * **Constraint Binding vs. Slack Theory:**
+          * **Binding Constraint (0 Slack):** A resource that is fully maxed out (e.g., Outsource Contractor limit = 30.0 artisans used, Slack = 0.0). It limits further optimization.
+          * **Non-Binding Constraint (Has Slack):** A resource with leftover capacity (e.g., Overtime days = 12.0 used out of 60.0 max, Slack = 48.0 days).
+        """)
+
+    with tab2:
         st.markdown("""
-        **🎓 LP Explanation for High Demand Surge Case:**
-        1. **Level 1 Bottleneck (Regular Payroll Overtime @ Day 2):** At 755u demand, the LP activates **30.0 days of Regular Payroll overtime**. Because Regular Payroll overtime costs **$2.67/unit output**, it is the cheapest way to expand capacity.
-        2. **Level 2 Bottleneck (Outsource Contractor Hiring @ Day 3):** At 1,130u demand, Regular Payroll overtime maxes out at **60.0 days (+150u output)**. The LP is forced to recruit **15 Outsource Contractors** ($5.00/u output) to cover the remaining volume.
-        3. **Level 3 Bottleneck (Management Capacity Cap @ Day 4):** At 1,500u demand, management utilization hits the absolute **250.0 / 250.0 units cap**, preventing further labor expansion.
-        4. **Level 4 Bottleneck (Equipment Capacity Ceiling @ Day 5):** Physical machine throughput caps at **1,500 units/day**, causing unprocessed orders to form a **Pre-Production Backlog Queue**.
+        ### 4. Worked Tutorials: Low Load vs High Load Demand Surge
+
+        #### 🟢 Case Example 1: Low Demand Load (~500 units/day)
+        * **Demand Scenario:** Daily incoming demand = 500 units. Starting stock = 500 Metal, 500 Stone.
+        * **LP Decision Analysis:**
+          * Baseline regular output capacity (860 units/day) exceeds 500 units.
+          * Overtime Authorized = **0.0 Days** (Slack = 60.0 days).
+          * Outsource Contractors Hired = **0.0 Artisans** (Slack = 30.0 artisans).
+          * Management Used = **164.5 / 250.0 u** (Slack = 85.5 u).
+          * Material Procured = **100 Metal / 100 Stone** (to replenish 400u consumed and maintain 500u ending stock).
+        * **Key Insight:** Under low load, baseline staff easily fulfills demand. Labor constraints have large slack.
+
+        ---
+
+        #### 🔴 Case Example 2: High Demand Surge (~1,130 units/day under 180 Management Cap)
+        * **Demand Scenario:** Incoming demand = 1,130 units (requires 270 extra units above 860u base).
+        * **LP Decision Analysis:**
+          * **Unit Output Cost Ranking:**
+            * Outsource Contractor: $40/day for 8u output = **$5.00/unit output** (Consumes 0.3 mgmt/artisan = 26.67 u output per mgmt unit).
+            * Regular Overtime: $20/day for 2.5u output = **$8.00/unit output** (Consumes 0.4 mgmt/day = 6.25 u output per mgmt unit).
+          * **LP Optimal Strategy:** Outsource Contractors are BOTH cheaper ($5.00 vs $8.00) and far more management-efficient!
+          * **Outsource Contractors Hired:** **30.0 Artisans (MAXED OUT — 0.0 Slack!)** -> Yields +240 units output.
+          * **Regular Overtime Days:** **12.0 Days (48.0 Days SLACK!)** -> Yields remaining +30 units output.
+          * **Management Used:** `164.5 + (12.0 * 0.4) + (30.0 * 0.3) = 178.3 / 180.0 u` (Slack = 1.7 u).
+        * **Key Insight:** The LP solver maxes out Outsource Contractors FIRST because they yield 26.67 units per management unit vs. overtime's 6.25 units per management unit. Overtime is kept low at 12.0 days, leaving **48.0 days of Overtime Slack**!
         """)
 
 # --- OPTION 2: MODE 1 DAILY DECISION GAME ---
 elif mode == "🎮 Option 2: Mode 1 - Daily Decision Game":
     st.header("🎮 Mode 1: Interactive Daily Decision Game (Player vs LP Benchmark)")
     
-    # Quick Reference Expander
     with st.expander("📌 Quick Reference: Factory Setup, Process Flow & Resource Constraints", expanded=False):
         st.markdown("""
         * **Manufacturing Lead Times:** Type O = 2 days (1 Pre + 1 Post), Type J = 3 days (1 Pre + 2 Post).
         * **Process Constraints:** Pre-Prod Cap = 1,500 u/day, Post-Prod Cap = 1,500 u/day.
         * **Raw Material Safety Floor:** Minimum 100 units Metal & 100 units Stone must be preserved at all times (`Usable Stock = Current Stock - 100`).
-        * **Management Budget Cap:** 250.0 units/day max management bandwidth.
-        * **Labor Costs:** Regular Payroll Overtime = $20/day ($2.67/u output), Outsource Contractors = $40/day ($5.00/u output).
+        * **Management Budget Cap:** 250.0 units/day max management bandwidth (or custom set cap).
+        * **Labor Unit Cost & Efficiency:** Outsource Contractors = $5.00/u output (26.67 u/mgmt), Regular Payroll Overtime = $8.00/u output (6.25 u/mgmt).
         """)
 
     if 'day' not in st.session_state:
@@ -277,7 +285,8 @@ elif mode == "🎮 Option 2: Mode 1 - Daily Decision Game":
         st.session_state.cum_player_cost = 0.0
         st.session_state.cum_lp_cost = 0.0
         st.session_state.game_history = []
-        st.session_state.submitted_day_results = None
+        st.session_state.last_comparison = None
+        st.session_state.submitted_today = False
 
     if st.session_state.day <= 7:
         st.subheader(f"📅 Simulation State: Day {st.session_state.day} of 7")
@@ -285,11 +294,11 @@ elif mode == "🎮 Option 2: Mode 1 - Daily Decision Game":
         # Student Instructions Card (White Background, Dark Navy Text)
         st.markdown(f"""
         <div class="instruction-card-light">
-            <h3>✍️ Student Instructions for Day {st.session_state.day}: Select Your 4 Decision Variables</h3>
-            <p>Welcome Factory Manager! Review today's incoming demand and backlog below. Select values for the <strong>4 Decision Variables</strong>, then click <strong>📩 Submit Decisions for Day {st.session_state.day}</strong> to evaluate your performance against the Linear Program (LP) benchmark.</p>
+            <h3>✍️ Instructions for Day {st.session_state.day}: Select Your 4 Decision Variables</h3>
+            <p>Welcome Manager! Review today's incoming demand and backlog below. Pick values for the <strong>4 Decision Variables</strong> to run the factory for Day {st.session_state.day}:</p>
             <ul>
-                <li><strong>1. Metal Purchase (units):</strong> Procure metal @ $50/unit (Remember to maintain the mandatory 100-unit safety floor!).</li>
-                <li><strong>2. Stone Purchase (units):</strong> Procure stone @ $100/unit (Remember to maintain the mandatory 100-unit safety floor!).</li>
+                <li><strong>1. Metal Purchase (units):</strong> Procure metal @ $50/unit (Remember to maintain the 100-unit safety floor!).</li>
+                <li><strong>2. Stone Purchase (units):</strong> Procure stone @ $100/unit (Remember to maintain the 100-unit safety floor!).</li>
                 <li><strong>3. Pre-Prod Regular Payroll Overtime (Days):</strong> Assign overtime to Regular Payroll staff (up to 0.5 days/artisan @ $20/day).</li>
                 <li><strong>4. Outsource Contractors to Hire (Artisans):</strong> Recruit Outsource Contractor artisans (8 units/day output @ $40/day).</li>
             </ul>
@@ -317,12 +326,12 @@ elif mode == "🎮 Option 2: Mode 1 - Daily Decision Game":
         curr_demand = demand_schedule.get(st.session_state.day, {"count": 43, "units": 500, "desc": "Standard Demand"})
         tot_queue_today = curr_demand['units'] + st.session_state.backlog_queue
 
-        st.info(f"📦 **Today's Incoming Demand (Day {st.session_state.day}):** {curr_demand['count']} Orders ({curr_demand['units']} units) — *{curr_demand['desc']}* | **Total Workload Queue to Process:** {tot_queue_today:.0f} units")
+        st.info(f"📦 **Today's Incoming Demand (Day {st.session_state.day}):** {curr_demand['count']} Orders ({curr_demand['units']} units) — *{curr_demand['desc']}* | **Total Workload Queue:** {tot_queue_today:.0f} units")
 
-        # STAGE 1: DECISION FORM
-        if st.session_state.submitted_day_results is None:
+        # STAGE 1: DECISION SUBMISSION FORM
+        if not st.session_state.submitted_today:
             with st.form("daily_decision_form"):
-                st.write(f"### 🛠️ Step 1: Select Decision Variables for Day {st.session_state.day}")
+                st.write(f"### 🛠️ Enter Decisions for Day {st.session_state.day}")
                 col_left, col_right = st.columns(2)
 
                 usable_m = max(0.0, st.session_state.metal_stock - 100.0)
@@ -340,16 +349,15 @@ elif mode == "🎮 Option 2: Mode 1 - Daily Decision Game":
                     ot_reg = st.slider("Pre-Prod Regular Payroll Overtime (Days):", 0.0, 60.0, 0.0, step=1.0)
                     hire_out = st.slider("Outsource Contractors to Hire (Artisans):", 0.0, 30.0, 0.0, step=1.0)
 
-                submit_btn = st.form_submit_button(f"📩 Submit Decisions for Day {st.session_state.day}", type="primary")
+                submitted = st.form_submit_button(f"📩 Submit Decisions for Day {st.session_state.day}", type="primary")
 
-            if submit_btn:
+            if submitted:
                 tot_avail_m = st.session_state.metal_stock + buy_m - 100.0
                 tot_avail_s = st.session_state.stone_stock + buy_s - 100.0
                 usable_mat = min(max(0.0, tot_avail_m), max(0.0, tot_avail_s))
                 
                 labor_cap = 860.0 + (ot_reg * 2.5) + (hire_out * 8.0)
                 max_possible_prod = min(tot_queue_today, labor_cap, 1500.0)
-                
                 feasible_prod = min(max_possible_prod, usable_mat)
                 
                 is_feasible = (feasible_prod >= tot_queue_today - 5.0) and (tot_avail_m >= 0.0) and (tot_avail_s >= 0.0)
@@ -371,7 +379,7 @@ elif mode == "🎮 Option 2: Mode 1 - Daily Decision Game":
                     
                 unprocessed = max(0.0, tot_queue_today - feasible_prod)
                 
-                st.session_state.submitted_day_results = {
+                st.session_state.last_comparison = {
                     'day': st.session_state.day,
                     'is_feasible': is_feasible,
                     'player_m': buy_m, 'lp_m': lp_res['buy_m'],
@@ -379,63 +387,83 @@ elif mode == "🎮 Option 2: Mode 1 - Daily Decision Game":
                     'player_ot': ot_reg, 'lp_ot': lp_res['ot_reg'],
                     'player_out': hire_out, 'lp_out': lp_res['hire_out'],
                     'player_cost': player_day_cost, 'lp_cost': lp_day_cost,
+                    'lp_res': lp_res,
                     'efficiency': efficiency,
                     'score_str': score_str,
                     'feasible_prod': feasible_prod,
                     'unprocessed': unprocessed,
                     'buy_m': buy_m, 'buy_s': buy_s
                 }
+                
+                st.session_state.submitted_today = True
                 st.rerun()
 
-        # STAGE 2: DISPLAY LP SOLUTION & COMPARISON
+        # STAGE 2: DISPLAY LP SOLUTION & ANALYSIS
         else:
-            comp = st.session_state.submitted_day_results
+            comp = st.session_state.last_comparison
+            lp_res = comp['lp_res']
+            
             st.markdown("---")
-            st.write(f"### 📊 Step 2: Day {comp['day']} Decision Analysis & LP Solution Comparison")
+            st.write(f"### 📊 Day {comp['day']} Decision Analysis & LP Solution Comparison")
             
             if not comp['is_feasible']:
-                st.error("🚨 PRODUCTION STALLED / FEASIBILITY FAILURE: Your material purchases or labor capacity were insufficient to process the workload, or raw material fell below the 100u safety floor. Production stalled and a 0.0% score was assigned for the turn.")
+                st.error("🚨 PRODUCTION STALLED / FEASIBILITY FAILURE: Your material purchases or labor capacity were insufficient to process the workload, or raw material fell below the 100u safety floor. Production stalled and a 0% score was assigned.")
             
-            # Side-by-side comparison table
+            # Side-by-Side Comparison Table
             comp_df = pd.DataFrame([
-                {"Decision Variable": "1. Metal Purchase (units)", "Player Choice": f"{comp['player_m']:.0f} u", "LP Optimal Choice": f"{comp['lp_m']:.0f} u", "Cost Impact": f"${((comp['player_m'] - comp['lp_m']) * 50):,.2f}"},
-                {"Decision Variable": "2. Stone Purchase (units)", "Player Choice": f"{comp['player_s']:.0f} u", "LP Optimal Choice": f"{comp['lp_s']:.0f} u", "Cost Impact": f"${((comp['player_s'] - comp['lp_s']) * 100):,.2f}"},
-                {"Decision Variable": "3. Regular Payroll Overtime (days)", "Player Choice": f"{comp['player_ot']:.1f} days", "LP Optimal Choice": f"{comp['lp_ot']:.1f} days", "Cost Impact": f"${((comp['player_ot'] - comp['lp_ot']) * 20):,.2f}"},
-                {"Decision Variable": "4. Outsource Contractors Hired (artisans)", "Player Choice": f"{comp['player_out']:.1f} artisans", "LP Optimal Choice": f"{comp['lp_out']:.1f} artisans", "Cost Impact": f"${((comp['player_out'] - comp['lp_out']) * 40):,.2f}"},
-                {"Decision Variable": "TOTAL DAILY OPERATIONAL SPEND", "Player Choice": f"${comp['player_cost']:,.2f}", "LP Optimal Choice": f"${comp['lp_cost']:,.2f}", "Cost Impact": f"${(comp['player_cost'] - comp['lp_cost']):,.2f}"}
+                {"Decision Variable": "1. Metal Purchase (units)", "Player Choice": f"{comp['player_m']:.0f} u", "LP Optimal": f"{comp['lp_m']:.0f} u", "Cost Impact": f"${((comp['player_m'] - comp['lp_m']) * 50):,.2f}"},
+                {"Decision Variable": "2. Stone Purchase (units)", "Player Choice": f"{comp['player_s']:.0f} u", "LP Optimal": f"{comp['lp_s']:.0f} u", "Cost Impact": f"${((comp['player_s'] - comp['lp_s']) * 100):,.2f}"},
+                {"Decision Variable": "3. Regular Payroll Overtime (days)", "Player Choice": f"{comp['player_ot']:.1f} days", "LP Optimal": f"{comp['lp_ot']:.1f} days", "Cost Impact": f"${((comp['player_ot'] - comp['lp_ot']) * 20):,.2f}"},
+                {"Decision Variable": "4. Outsource Contractors Hired (artisans)", "Player Choice": f"{comp['player_out']:.1f} artisans", "LP Optimal": f"{comp['lp_out']:.1f} artisans", "Cost Impact": f"${((comp['player_out'] - comp['lp_out']) * 40):,.2f}"},
+                {"Decision Variable": "TOTAL DAILY OPERATIONAL SPEND", "Player Choice": f"${comp['player_cost']:,.2f}", "LP Optimal": f"${comp['lp_cost']:,.2f}", "Cost Impact": f"${(comp['player_cost'] - comp['lp_cost']):,.2f}"}
             ])
             st.table(comp_df)
 
+            # Detailed Comparative Situation Explanations
             diff_cost = comp['player_cost'] - comp['lp_cost']
             if diff_cost > 1.0:
                 st.warning(f"""
                 #### 🔵 Comparative Situation Analysis: Player Spend is Higher (+${diff_cost:,.2f})
-                **Why the LP Solution Choice is Better & More Optimal:**
-                1. **Material Procurement Efficiency:** The LP purchased the exact minimum raw materials needed to preserve the 100u safety floor without locking up excess cash in inventory.
-                2. **Labor Class Cost Hierarchy:** Regular Payroll Overtime ($20/day = $2.67/unit output) is far cheaper than Outsource Contractors ($40/day = $5.00/unit output). The LP maxed out cheap overtime before hiring contractors.
-                3. **Management Bandwidth Protection:** The LP carefully balances overtime and contractor hiring to stay within the 250u management cap.
+                **Why the LP Solution is Better & More Optimal:**
+                1. **Material Inventory Efficiency:** The LP purchased the exact minimum quantity required to keep raw stock above the 100u safety floor without tying up extra cash in inventory.
+                2. **Labor Class Ranking & Management Efficiency:** Outsource Contractors ($40/day for 8u = $5.00/u output) yield **26.67 units per mgmt unit** vs. Regular Overtime ($20/day for 2.5u = $8.00/u output) which yields **6.25 units per mgmt unit**. The LP solver maxes out Outsource Contractors first because they are both cheaper and far more management-efficient!
+                3. **Management Bandwidth Protection:** The LP carefully balances overtime and contractor hiring to stay within the management cap.
                 """)
             elif diff_cost < -1.0:
                 st.info(f"""
                 #### 🟠 Comparative Situation Analysis: Player Spend is Lower (${diff_cost:,.2f} less)
-                **Why the LP Solution Choices are Necessary & Optimal:**
+                **Why the LP Solution Chosen Choices are Necessary & Optimal:**
                 1. **Preventing Production Stalls:** While your daily cash outflow appeared lower, under-purchasing materials risks stalling production or violating the 100u safety floor.
-                2. **Preventing Backlog Accumulation:** Under-investing in labor causes orders to get trapped in the backlog queue, risking late delivery penalties.
+                2. **Preventing Order Backlog Accumulation:** Under-investing in overtime/contractors causes orders to get trapped in the backlog queue, risking late delivery penalties.
                 3. **Full Demand Fulfillment:** The LP spend is optimal because it guarantees 100% throughput while maintaining the 100u safety floor.
                 """)
             else:
-                st.success("🌟 **PERFECT OPTIMIZATION MATCH!** Your decision choices matched the LP optimal benchmark perfectly across all 4 variables.")
+                st.success("🌟 **PERFECT OPTIMIZATION!** Your decision choices matched the LP optimal benchmark perfectly across all 4 variables.")
 
-            # White Fill Callout Banner directing to Next Step
-            st.markdown("""
-            <div class="lp-callout-nofill">
+            # Constraint Binding & Slack Analysis Box
+            st.markdown(f"""
+            <div class="instruction-card-light">
+                <h4>🔎 LP Constraint Binding & Slack Analysis for Day {comp['day']}</h4>
+                <p>Understanding which constraints are <strong>Binding (0 Slack)</strong> vs. <strong>Unconstrained (Has Slack)</strong> reveals how the LP solver chooses decision variables:</p>
+                <ul>
+                    <li><strong>Outsource Contractor Constraint (30 Artisans Max):</strong> {("🔴 BINDING (0.0 Artisans Slack — MAXED OUT!)" if lp_res['out_slack'] < 0.1 else f"🟢 SLACK ({lp_res['out_slack']:.1f} Artisans Headroom Available)")} <br><em>Explanation:</em> Outsource Contractors yield 26.67 units per management unit ($5.00/u output). The LP maxes out contractors first before using overtime.</li>
+                    <li><strong>Regular Overtime Constraint (60 Days Max):</strong> {("🔴 BINDING (0.0 Days Slack — MAXED OUT!)" if lp_res['ot_slack'] < 0.1 else f"🟢 SLACK ({lp_res['ot_slack']:.1f} Days Overtime Headroom Left)")} <br><em>Explanation:</em> Overtime is used only for remaining workload after contractor limits are reached.</li>
+                    <li><strong>Management Bandwidth Constraint (250.0 u Cap):</strong> {("🔴 BINDING (0.0 u Mgmt Headroom Left)" if lp_res['mgmt_slack'] < 0.1 else f"🟢 SLACK ({lp_res['mgmt_slack']:.1f} u Mgmt Headroom Available)")} <br><em>Explanation:</em> Total management consumed = {lp_res['mgmt_used']:.1f} u.</li>
+                    <li><strong>Equipment Capacity Ceiling (1,500 u/day):</strong> {("🔴 BINDING (0.0 u Equipment Headroom Left)" if lp_res['equip_slack'] < 0.1 else f"🟢 SLACK ({lp_res['equip_slack']:.1f} u Equipment Capacity Available)")}</li>
+                </ul>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # Clean white callout card with dark text (no dark fill)
+            st.markdown(f"""
+            <div class="instruction-card-light">
                 <h4>👉 LP Solution Analysis Complete!</h4>
-                <p>Review the LP optimal choices and comparative analysis above. When you are ready to advance the factory to the next simulation day, click the button below.</p>
+                <p>Review the LP optimal choices, cost comparison, and constraint slack analysis above. When you are ready to proceed to the next simulation day, click the button below.</p>
             </div>
             """, unsafe_allow_html=True)
 
             if st.button(f"▶ Step 1 Day Forward to Day {st.session_state.day + 1}", type="primary"):
-                # Execute day state update
+                comp = st.session_state.last_comparison
                 st.session_state.backlog_queue = comp['unprocessed']
                 st.session_state.metal_stock = max(100.0, st.session_state.metal_stock + comp['buy_m'] - comp['feasible_prod'])
                 st.session_state.stone_stock = max(100.0, st.session_state.stone_stock + comp['buy_s'] - comp['feasible_prod'])
@@ -454,26 +482,20 @@ elif mode == "🎮 Option 2: Mode 1 - Daily Decision Game":
                 })
                 
                 st.session_state.day += 1
-                st.session_state.submitted_day_results = None
+                st.session_state.submitted_today = False
+                st.session_state.last_comparison = None
                 st.rerun()
 
         if st.session_state.game_history:
             st.write("### 📈 7-Day Performance Ledger")
-            st.dataframe(pd.DataFrame(st.session_state.game_history), width='stretch')
+            st.dataframe(pd.DataFrame(st.session_state.game_history), use_container_width=True)
 
     else:
         st.balloons()
         st.success("🎉 **7-DAY SIMULATION COMPLETED!** All 7 days have been processed. Review your final performance summary below.")
-        
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Total Player Spend", f"${st.session_state.cum_player_cost:,.2f}")
-        c2.metric("Total LP Optimal Benchmark", f"${st.session_state.cum_lp_cost:,.2f}")
-        gap = st.session_state.cum_player_cost - st.session_state.cum_lp_cost
-        c3.metric("Total Cost Gap", f"${gap:,.2f}", delta="-Excess Spend" if gap > 0 else "+Optimal")
-
-        st.write("### 📈 Final 7-Day Performance Ledger")
-        st.dataframe(pd.DataFrame(st.session_state.game_history), width='stretch')
-
+        if st.session_state.game_history:
+            st.dataframe(pd.DataFrame(st.session_state.game_history), use_container_width=True)
+            
         if st.button("🔄 Restart 7-Day Game Session", type="primary"):
             st.session_state.day = 1
             st.session_state.metal_stock = 500.0
@@ -484,19 +506,20 @@ elif mode == "🎮 Option 2: Mode 1 - Daily Decision Game":
             st.session_state.cum_player_cost = 0.0
             st.session_state.cum_lp_cost = 0.0
             st.session_state.game_history = []
-            st.session_state.submitted_day_results = None
+            st.session_state.last_comparison = None
+            st.session_state.submitted_today = False
             st.rerun()
 
 # --- OPTION 3: MODE 2 DIGITAL TWIN SANDBOX ---
 else:
     st.header("🔬 Mode 2: Digital Twin Sensitivity Sandbox")
-    st.info("💡 **Goal:** Test how changing factory constraints, demand multipliers, and order mix alters 7-day costs and throughput. Observe how system bottlenecks shift dynamically day-by-day!")
+    st.info("💡 **Goal:** Test how changing factory constraints, demand multipliers, and order mix alters 7-day costs and throughput. Watch how bottlenecks and constraint slacks shift across parameter choices.")
 
     col1, col2, col3 = st.columns(3)
 
     with col1:
         st.markdown("#### Factory Constraints")
-        mgt_cap = st.slider("Management Capacity Limit (units/day):", 100, 300, 250, step=10)
+        mgt_cap = st.slider("Management Capacity Limit (units/day):", 100, 300, 180, step=10)
         equip_cap = st.slider("Equipment Capacity (units/day):", 500, 2000, 1500, step=100)
 
     with col2:
@@ -510,88 +533,63 @@ else:
         p_stone = st.number_input("Stone Price ($/unit):", value=100.0, step=5.0)
 
     if st.button("▶ Run Full 7-Day Digital Twin Simulation", type="primary"):
-        st.write("### 📈 7-Day Digital Twin Simulation Results Ledger")
+        st.write("### 📈 7-Day Digital Twin Simulation Results")
         
         base_demand_units = [500, 755, 1130, 500, 755, 500, 500]
-        sim_data = []
+        sim_ledger = []
 
         cum_cost = 0.0
-        backlog = 0.0
-        starting_m = 500.0
-        starting_s = 500.0
+        curr_backlog = 0.0
+        sim_metal = 500.0
+        sim_stone = 500.0
 
-        for d_idx, base_u in enumerate(base_demand_units, 1):
-            raw_req = int(base_u * demand_mult)
-            workload_recv = raw_req + backlog
+        for d_idx, raw_recv in enumerate(base_demand_units, 1):
+            recv_demand = raw_recv * demand_mult
+            workload = recv_demand + curr_backlog
             
-            # Usable materials
-            usable_m = max(0.0, starting_m - 100.0)
-            usable_s = max(0.0, starting_s - 100.0)
-            proc_m = max(0.0, workload_recv - usable_m)
-            proc_s = max(0.0, workload_recv - usable_s)
+            # Solve LP benchmark for this exact daily workload & management limit
+            lp_res = solve_daily_lp_benchmark(d_idx, workload, mgt_limit=mgt_cap, equip_limit=equip_cap, starting_metal=sim_metal, starting_stone=sim_stone)
             
-            mat_cost = (proc_m * p_metal) + (proc_s * p_stone)
+            proc_units = min(workload, lp_res['output_cap'], float(equip_cap))
+            rem_backlog = max(0.0, workload - proc_units)
             
-            # Labor output capacity calculation
-            # Regular output = 860u. Extra needed = workload_recv - 860u
-            extra_needed = max(0.0, workload_recv - 860.0)
+            mat_cost = (lp_res['buy_m'] * p_metal) + (lp_res['buy_s'] * p_stone)
+            labor_cost = 3650.0 + (lp_res['ot_reg'] * 20.0) + (lp_res['hire_out'] * 40.0)
+            day_tot_cost = mat_cost + labor_cost
+            cum_cost += day_tot_cost
             
-            # Max regular OT = 60 days (+150u)
-            ot_days = min(60.0, extra_needed / 2.5)
-            rem_needed = max(0.0, extra_needed - (ot_days * 2.5))
-            
-            # Outsource contractors needed (+8u per artisan)
-            out_artisans = rem_needed / 8.0
-            
-            mgt_used = 164.5 + (ot_days * 0.4) + (out_artisans * 0.3)
-            
-            # Bottleneck identification
-            if mgt_used > mgt_cap:
-                mgt_used = mgt_cap
-                bottleneck = "🔴 Management Bandwidth Limit Maxed"
-            elif workload_recv > equip_cap:
-                bottleneck = "⚠️ Equipment Capacity Ceiling Reached"
-            elif ot_days >= 60.0:
-                bottleneck = "🟡 Regular Overtime Limit Reached (60 days max)"
-            elif ot_days > 0.0:
-                bottleneck = "🔵 Regular Payroll Overtime Active"
-            else:
-                bottleneck = "🟢 Baseline Capacity (No Bottleneck)"
-                
-            labor_cost = 3650.0 + (ot_days * 20.0) + (out_artisans * 40.0)
-            tot_cost = mat_cost + labor_cost
-            cum_cost += tot_cost
-            
-            units_proc = min(workload_recv, equip_cap, 860.0 + ot_days*2.5 + out_artisans*8.0)
-            backlog = max(0.0, workload_recv - units_proc)
+            # Update state for next day
+            sim_metal = max(100.0, sim_metal + lp_res['buy_m'] - proc_units)
+            sim_stone = max(100.0, sim_stone + lp_res['buy_s'] - proc_units)
+            curr_backlog = rem_backlog
 
-            sim_data.append({
+            sim_ledger.append({
                 "Day": f"Day {d_idx}",
-                "Workload Received": f"{workload_recv:.0f} u",
-                "Units Processed": f"{units_proc:.0f} u",
-                "Backlog": f"{backlog:.0f} u",
-                "Management Used": f"{mgt_used:.1f} / {mgt_cap:.1f} u",
-                "Overtime days": f"{ot_days:.1f} days",
-                "Additional Outsource Contractors used": f"{out_artisans:.1f} artisans",
+                "Workload Received": f"{workload:.0f} u",
+                "Units Processed": f"{proc_units:.0f} u",
+                "Backlog": f"{rem_backlog:.0f} u",
+                "Management Used": f"{lp_res['mgmt_used']:.1f} / {mgt_cap} u",
+                "Overtime days": f"{lp_res['ot_reg']:.1f} days",
+                "Additional Outsource Contractors used": f"{lp_res['hire_out']:.1f} artisans",
                 "Raw Material Cost": f"${mat_cost:,.2f}",
                 "Labor Cost": f"${labor_cost:,.2f}",
-                "Total Cost": f"${tot_cost:,.2f}",
-                "Active Bottleneck / LP Constraint": bottleneck
+                "Total Cost": f"${day_tot_cost:,.2f}",
+                "Active Bottleneck / LP Constraint": lp_res['bottleneck']
             })
 
-            starting_m = max(100.0, starting_m + proc_m - units_proc)
-            starting_s = max(100.0, starting_s + proc_s - units_proc)
+        st.dataframe(pd.DataFrame(sim_ledger), use_container_width=True)
 
-        st.dataframe(pd.DataFrame(sim_data), width='stretch')
-
-        st.metric("Total 7-Day Simulation Operational Spend", f"${cum_cost:,.2f}")
+        st.metric("Total 7-Day Simulation Cost", f"${cum_cost:,.2f}")
         
-        # Sensitivity Analysis Writeup
-        st.markdown("---")
-        st.write("### 🧠 Parameter Sensitivity & Bottleneck Shift Analysis")
-        st.info(f"""
-        **System Sensitivity Insights for Current Settings:**
-        1. **Management Capacity Sensitivity (Current Limit = {mgt_cap} u):** If management capacity is increased beyond ~220 units/day, management ceases to be a binding constraint. The primary bottleneck shifts entirely to the **{equip_cap} units/day Equipment Capacity Ceiling**.
-        2. **Demand Multiplier Impact (Current Multiplier = {demand_mult}x):** At demand multipliers > 1.5x, Regular Payroll overtime reaches its 60-day cap (+150u output). The solver is forced to recruit Outsource Contractors ($5.00/u output), inflating daily labor costs by +87.5%.
-        3. **Type J Order Mix Dwell Time Impact (Current Ratio = {type_j_ratio}%):** Type J orders require 2 days in Post-Production finishing. Increasing the Type J ratio above 30% increases Post-Production WIP dwell time, reducing weekly order completions and increasing work-in-progress holding costs.
-        """)
+        # Detailed System Bottleneck & Sensitivity Analysis
+        st.markdown(f"""
+        <div class="instruction-card-light">
+            <h4>🧠 Digital Twin Constraint Sensitivity & Bottleneck Analysis</h4>
+            <p><strong>Observations for Management Limit = {mgt_cap} u & Equipment Limit = {equip_cap} u:</strong></p>
+            <ul>
+                <li><strong>Outsource Contractor vs Overtime Priority:</strong> Outsource Contractors yield <strong>26.67 units per mgmt unit</strong> ($5.00/u output) whereas Regular Overtime yields <strong>6.25 units per mgmt unit</strong> ($8.00/u output). The LP solver maxes out Outsource Contractors to 30 artisans first before utilizing overtime.</li>
+                <li><strong>Management Bandwidth Shift:</strong> When management capacity is set to <strong>180.0 u</strong>, management bandwidth becomes the binding constraint (0.0 slack) during surge days (Day 3 workload = 1,130u). Outsource contractors are maxed out (30 artisans), while Regular Overtime has <strong>~48.0 days of Slack</strong> because additional overtime would exceed the 180u management cap.</li>
+                <li><strong>Equipment Bottleneck Threshold:</strong> If management capacity is increased beyond ~220 u, management ceases to be a constraint. On high demand surges (e.g., >1,500 u), the <strong>{equip_cap} u/day Equipment Capacity Ceiling</strong> becomes the binding constraint, causing backlog queue accumulation.</li>
+            </ul>
+        </div>
+        """, unsafe_allow_html=True)
